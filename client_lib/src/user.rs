@@ -27,7 +27,8 @@ use std::fs;
 use std::io;
 use std::io::{BufRead, BufReader, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{cell::RefCell, collections::HashMap};
+use std::{collections::HashMap};
+use std::sync::RwLock;
 use tls_codec::{Serialize as TlsSerialize, Deserialize as TlsDeserialize};
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
@@ -51,15 +52,15 @@ impl Contact {
 #[derive(Serialize, Deserialize)]
 pub struct Group {
     group_name: String,
-    mls_group: RefCell<MlsGroup>,
+    mls_group: RwLock<MlsGroup>,
     // The "only" contact that is also in this group.
     only_contact: Option<Contact>,
 }
 
 pub struct User {
     pub(crate) username: String,
-    pub(crate) groups: RefCell<HashMap<Vec<u8>, Group>>,
-    pub(crate) identity: RefCell<Identity>,
+    pub(crate) groups: RwLock<HashMap<Vec<u8>, Group>>,
+    pub(crate) identity: RwLock<Identity>,
     provider: OpenMlsRustPersistentCrypto,
     file_dir: String,
     tag: String,
@@ -78,7 +79,7 @@ impl User {
     ) -> io::Result<Self> {
         let mut crypto = OpenMlsRustPersistentCrypto::default();
         let groups = if first_time {
-            RefCell::new(HashMap::new())
+            RwLock::new(HashMap::new())
         } else {
             Self::restore_groups_state(file_dir.clone(), tag.clone())
         };
@@ -107,7 +108,7 @@ impl User {
         let out = Self {
             username: username.clone(),
             groups,
-            identity: RefCell::new(Identity::new(
+            identity: RwLock::new(Identity::new(
                 CIPHERSUITE,
                 &crypto,
                 username.as_bytes(),
@@ -125,7 +126,7 @@ impl User {
 
     pub fn deregister(&mut self) -> io::Result<()> {
         self.identity
-            .borrow()
+            .read().unwrap()
             .delete_signature_key(self.file_dir.clone(), self.tag.clone());
 
         let _ = fs::remove_file(self.file_dir.clone() + "/registration_done");
@@ -158,7 +159,7 @@ impl User {
     /// Get the key packages fo this user.
     pub fn key_packages(&self) -> Vec<(Vec<u8>, KeyPackage)> {
         // clone first !
-        let kpgs = self.identity.borrow().kp.clone();
+        let kpgs = self.identity.read().unwrap().kp.clone();
         Vec::from_iter(kpgs)
     }
 
@@ -184,10 +185,10 @@ impl User {
 
         let mut mls_group = MlsGroup::new_with_group_id(
             &self.provider,
-            &self.identity.borrow().signer,
+            &self.identity.read().unwrap().signer,
             &group_config,
             GroupId::from_slice(group_id),
-            self.identity.borrow().credential_with_key.clone(),
+            self.identity.read().unwrap().credential_with_key.clone(),
         )
         .expect("Failed to create MlsGroup");
         //FIXME: needed?
@@ -195,13 +196,13 @@ impl User {
 
         let group = Group {
             group_name: name.clone(),
-            mls_group: RefCell::new(mls_group),
+            mls_group: RwLock::new(mls_group),
             only_contact: None,
         };
 
         if self
             .groups
-            .borrow_mut()
+            .write().unwrap()
             .insert(group_id.to_vec(), group)
             .is_some()
         {
@@ -215,7 +216,7 @@ impl User {
 
         // Build a proposal with this key package and do the MLS bits.
         let group_id = group_name.as_bytes();
-        let mut groups = self.groups.borrow_mut();
+        let mut groups = self.groups.write().unwrap();
         let group = match groups.get_mut(group_id) {
             Some(g) => g,
             None => {
@@ -238,10 +239,10 @@ impl User {
         // two members, an inviter (camera) and an invitee (app).
         let (_out_messages, welcome, _group_info) = group
             .mls_group
-            .borrow_mut()
+            .write().unwrap()
             .add_members(
                 &self.provider,
-                &self.identity.borrow().signer,
+                &self.identity.read().unwrap().signer,
                 &[joiner_key_package],
             )
             .map_err(|e| {
@@ -254,7 +255,7 @@ impl User {
         // First, process the invitation on our end.
         group
             .mls_group
-            .borrow_mut()
+            .write().unwrap()
             .merge_pending_commit(&self.provider)
             .expect("error merging pending commit");
 
@@ -320,7 +321,7 @@ impl User {
             let credential = BasicCredential::try_from(credential).unwrap();
             if expected_inviter.id == credential.identity() {
                 inviter_confirmed = true;
-            } else if self.identity.borrow().identity() == credential.identity() {
+            } else if self.identity.read().unwrap().identity() == credential.identity() {
                 invitee_confirmed = true;
             }
         }
@@ -334,13 +335,13 @@ impl User {
 
         let group = Group {
             group_name: group_name.clone(),
-            mls_group: RefCell::new(mls_group),
+            mls_group: RwLock::new(mls_group),
             only_contact: Some(expected_inviter),
         };
 
         log::trace!("   {}", group_name);
 
-        match self.groups.borrow_mut().insert(group_id, group) {
+        match self.groups.write().unwrap().insert(group_id, group) {
             Some(_old) => panic!("Error: duplicate group"),
             None => Ok(()),
         }
@@ -382,7 +383,8 @@ impl User {
             .expect("Could not convert time")
             .as_nanos();
 
-        let data = bincode::serialize(&self.groups.get_mut()).unwrap();
+               let groups = self.groups.write().unwrap();
+        let data = bincode::serialize(&*groups).unwrap();
         let pathname = self.file_dir.clone()
             + "/groups_state_"
             + &self.tag.clone()
@@ -437,7 +439,7 @@ impl User {
         }
     }
 
-    pub fn restore_groups_state(file_dir: String, tag: String) -> RefCell<HashMap<Vec<u8>, Group>> {
+    pub fn restore_groups_state(file_dir: String, tag: String) -> RwLock<HashMap<Vec<u8>, Group>> {
         let g_files =
             Self::get_state_files_sorted(&file_dir, &("groups_state_".to_string() + &tag + "_"))
                 .unwrap();
@@ -449,7 +451,7 @@ impl User {
             let data = reader.fill_buf().unwrap();
             let deserialize_result = bincode::deserialize(data);
             if let Ok(deserialized_data) = deserialize_result {
-                return RefCell::new(deserialized_data);
+                return RwLock::new(deserialized_data);
             }
         }
 
@@ -504,7 +506,7 @@ impl User {
         };
 
         let contact_comp = Some(contact.clone());
-        for (_group_id, group) in self.groups.borrow().iter() {
+        for (_group_id, group) in self.groups.read().unwrap().iter() {
             if group.only_contact == contact_comp {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -517,7 +519,7 @@ impl User {
     }
 
     pub fn get_group_name(&self, only_contact_name: String) -> io::Result<String> {
-        for (_, group) in self.groups.borrow().iter() {
+        for (_, group) in self.groups.read().unwrap().iter() {
             if group.only_contact.is_some()
                 && group.only_contact.as_ref().unwrap().username == only_contact_name
             {
@@ -534,7 +536,7 @@ impl User {
     /// Generate a commit to update self leaf node in the ratchet tree, merge the commit, and return the message
     /// to be sent to other group members.
     pub fn update(&self, group_name: String) -> io::Result<(Vec<u8>, u64)> {
-        let groups = self.groups.borrow();
+        let groups = self.groups.read().unwrap();
         let group = match groups.get(group_name.as_bytes()) {
             Some(g) => g,
             None => {
@@ -549,10 +551,10 @@ impl User {
         // See openmls/src/group/mls_group/updates.rs.
         let (out_message, _welcome, _group_info) = group
             .mls_group
-            .borrow_mut()
+            .write().unwrap()
             .self_update(
                 &self.provider,
-                &self.identity.borrow().signer,
+                &self.identity.read().unwrap().signer,
                 LeafNodeParameters::default(),
             )
             .map_err(|e| {
@@ -567,7 +569,7 @@ impl User {
         // Merge pending commit.
         group
             .mls_group
-            .borrow_mut()
+            .write().unwrap()
             .merge_pending_commit(&self.provider)
             .expect("error merging pending commit");
 
@@ -581,7 +583,7 @@ impl User {
 
         let epoch = group
             .mls_group
-            .borrow()
+            .read().unwrap()
             .epoch()
             .as_u64();
 
@@ -590,7 +592,7 @@ impl User {
 
     /// Encrypts a message and returns the ciphertext
     pub fn encrypt(&mut self, bytes: &[u8], group_name: String) -> io::Result<Vec<u8>> {
-        let groups = self.groups.borrow();
+        let groups = self.groups.read().unwrap();
         let group = match groups.get(group_name.as_bytes()) {
             Some(g) => g,
             None => {
@@ -603,8 +605,8 @@ impl User {
 
         let message_out = group
             .mls_group
-            .borrow_mut()
-            .create_message(&self.provider, &self.identity.borrow().signer, bytes)
+            .write().unwrap()
+            .create_message(&self.provider, &self.identity.read().unwrap().signer, bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e}")))?;
 
         let msg = GroupMessage::new(message_out.into(), &self.recipients(group));
@@ -625,7 +627,7 @@ impl User {
         message: ProtocolMessage,
         app_msg: bool,
     ) -> io::Result<Vec<u8>> {
-        let mut groups = self.groups.borrow_mut();
+        let mut groups = self.groups.write().unwrap();
 
         let group = match groups.get_mut(message.group_id().as_slice()) {
             Some(g) => g,
@@ -639,7 +641,7 @@ impl User {
                 ));
             }
         };
-        let mut mls_group = group.mls_group.borrow_mut();
+        let mut mls_group = group.mls_group.write().unwrap();
 
         // This works since none of the other members of the group, other than the camera,
         // will be in our contact list (hence "only_matching_contact").
